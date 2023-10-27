@@ -13,6 +13,7 @@ class UDPBasedProtocol:
         self.udp_socket = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)
         self.remote_addr = remote_addr
         self.udp_socket.bind(local_addr)
+        self.udp_socket.settimeout(0.1)
 
     def sendto(self, data):
         return self.udp_socket.sendto(data, self.remote_addr)
@@ -77,31 +78,20 @@ class MyTCPProtocol(UDPBasedProtocol):
         self.send_msgs = []
         self.recv_msgs = []
         self.max_msg_size = 32768 - HEADER_SIZE
-        self.ack_sleep_time = 0.1
-        self.resend_sleep_time = 0.1
         self.logger = logging.getLogger(f"P{MyTCPProtocol.id}")
         MyTCPProtocol.id += 1
 
-    def _wait_and_resend(self):
-        while len(self.send_msgs) != 0:
-            for msg in self.send_msgs:
-                self.logger.debug(f"resend msg {msg}")
-                self._send_msg(msg, False)
-
-            time.sleep(self.resend_sleep_time)
-
     def _recv_acks(self):
-        while len(self.send_msgs) != 0:
-            msgs = self._recv_msgs()
-            for msg in msgs:
-                self.logger.debug(f"ack recv {msg}")
-                while len(self.send_msgs) != 0:
-                    # Remove msgs from resend storage if they are acknowledged
-                    stored_msg = self.send_msgs[0]
-                    if msg.header.ack_num > stored_msg.header.seq_num + len(stored_msg.data):
-                        self.send_msgs.pop(0)
-                    else:
-                        break
+        msgs = self._recv_msgs()
+        for msg in msgs:
+            self.logger.debug(f"ack recv {msg}")
+            while len(self.send_msgs) != 0:
+                # Remove msgs from resend storage if they are acknowledged
+                stored_msg = self.send_msgs[0]
+                if msg.header.ack_num > stored_msg.header.seq_num + len(stored_msg.data):
+                    self.send_msgs.pop(0)
+                else:
+                    break
 
     def _send_msg(self, msg : MyTCPMsg, increase_seq = True):
         if increase_seq:
@@ -135,15 +125,15 @@ class MyTCPProtocol(UDPBasedProtocol):
             self.send_msgs.append(msg)
             self.logger.debug(f"msg send {msg} | {bytes_send}/{len(data)}")
 
-        resend_thread = TestableThread(target=self._wait_and_resend)
-        # Start thread that will resend lost messages
-        resend_thread.start()
+        # Receive acks and resend if timeout
+        while len(self.send_msgs) != 0:
+            try:
+                self._recv_acks()
+            except socket.timeout:
+                for msg in self.send_msgs:
+                    self.logger.debug(f"resend msg {msg}")
+                    self._send_msg(msg, False)
 
-        # Wait ack for sent messages
-        ack_thread = TestableThread(target=self._recv_acks)
-        ack_thread.start()
-
-        # resend_thread.join()
         self.logger.debug("end send")
         return bytes_send
 
@@ -152,11 +142,6 @@ class MyTCPProtocol(UDPBasedProtocol):
         msg = MyTCPMsg(header, bytes())
         self.logger.debug(f"ack send {msg}")
         self._send_msg(msg)
-
-    def _wait_and_ack_num(self):
-        while self._wait_and_ack_num_flag:
-            self._send_ack()
-            time.sleep(self.ack_sleep_time)
 
     # Restore data in appropriate order
     def _restore_data(self):
@@ -182,20 +167,16 @@ class MyTCPProtocol(UDPBasedProtocol):
     def recv(self, n: int):
         self.logger.debug("start recv")
         data = bytes()
-        self._wait_and_ack_num_flag = True
-        ack_thread = TestableThread(target=self._wait_and_ack_num)
-        # Start thread that will periodically send ack for received messages
-        ack_thread.start()
         while len(data) < n:
-            msgs = self._recv_msgs()
-            self.recv_msgs.extend(msgs)
-            data += self._restore_data()
-            self._send_ack()
-            for msg in msgs:
-                self.logger.debug(f"msg recv {msg} | {len(data)}/{n}")
+            try:
+                msgs = self._recv_msgs()
+                self.recv_msgs.extend(msgs)
+                data += self._restore_data()
+                for msg in msgs:
+                    self.logger.debug(f"msg recv {msg} | {len(data)}/{n}")
+            except socket.timeout:
+                self._send_ack()
 
-        self._wait_and_ack_num_flag = False
-        # ack_thread.join()
         self._send_ack()
         self.logger.debug("end recv")
         return data[:n]
