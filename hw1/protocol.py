@@ -1,7 +1,7 @@
 import socket
-import time
 import logging
 
+from sortedcontainers import SortedList
 from testable_thread import TestableThread
 
 logging.basicConfig(encoding='utf-8', level=logging.INFO)
@@ -13,10 +13,16 @@ class UDPBasedProtocol:
         self.udp_socket = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)
         self.remote_addr = remote_addr
         self.udp_socket.bind(local_addr)
-        self.udp_socket.settimeout(0.1)
+        self.udp_socket.settimeout(0)
 
     def sendto(self, data):
-        return self.udp_socket.sendto(data, self.remote_addr)
+        bytes = 0
+        while not bytes:
+            try:
+                bytes = self.udp_socket.sendto(data, self.remote_addr)
+                return bytes
+            except PermissionError:
+                pass
 
     def recvfrom(self, n):
         msg, addr = self.udp_socket.recvfrom(n)
@@ -24,37 +30,29 @@ class UDPBasedProtocol:
 
 
 class MyTCPHeader():
-    def __init__(self, seq : int, ack : int, msg_size : int):#, checksum : bytes):
+    def __init__(self, seq : int, ack : int, msg_size : int):
         self.seq_num = seq
         self.ack_num = ack
         self.size = msg_size
-        # self.checksum = checksum
 
     @staticmethod
     def deserialize(data : bytes):
         seq = int.from_bytes(data[0:4], byteorder='little')
         ack = int.from_bytes(data[4:8], byteorder='little')
         size = int.from_bytes(data[8:12], byteorder='little')
-        # checksum = data[8:40]
-        return MyTCPHeader(seq, ack, size)#, checksum)
+        return MyTCPHeader(seq, ack, size)
 
     def serialize(self) -> bytes:
         seq = self.seq_num.to_bytes(4, byteorder='little')
         ack = self.ack_num.to_bytes(4, byteorder='little')
         size = self.size.to_bytes(4, byteorder='little')
-        #checksum = self.checksum
-        return seq + ack + size# + checksum
+        return seq + ack + size
 
 
 class MyTCPMsg():
     def __init__(self, header, data):
         self.header = header
         self.data = data
-        # assert(self.is_valid())
-
-    # def is_valid(self) -> bool:
-    #     hash = hashlib.shake_256(self.data)
-    #     return hash.digest(32) == self.header.checksum
 
     @staticmethod
     def deserialize(data : bytes):
@@ -76,19 +74,29 @@ class MyTCPProtocol(UDPBasedProtocol):
         self.seq_num = 0
         self.ack_num = 1
         self.send_msgs = []
-        self.recv_msgs = []
+        self.recv_msgs = SortedList(key=lambda x : x.header.seq_num)
         self.max_msg_size = 32768 - HEADER_SIZE
+        self.resend_rate = 2
+        self.ack_rate = 2
+        self.max_resend_attempt = 1024
         self.logger = logging.getLogger(f"P{MyTCPProtocol.id}")
         MyTCPProtocol.id += 1
+
+    def _is_msg_ack_by_ack(self, msg, ack):
+        return ack.header.ack_num > msg.header.seq_num + len(msg.data)
 
     def _recv_acks(self):
         msgs = self._recv_msgs()
         for msg in msgs:
             self.logger.debug(f"ack recv {msg}")
+            if self.seq_num < msg.header.ack_num:
+                self.send_msgs.clear()
+                if len(msg.data) != 0:
+                    self.recv_msgs.add(msg)
             while len(self.send_msgs) != 0:
                 # Remove msgs from resend storage if they are acknowledged
                 stored_msg = self.send_msgs[0]
-                if msg.header.ack_num > stored_msg.header.seq_num + len(stored_msg.data):
+                if self._is_msg_ack_by_ack(stored_msg, msg):
                     self.send_msgs.pop(0)
                 else:
                     break
@@ -101,15 +109,19 @@ class MyTCPProtocol(UDPBasedProtocol):
         return self.sendto(data_with_header) - HEADER_SIZE
 
     def _recv_msgs(self):
-        buf = self.recvfrom(100 * self.max_msg_size)
-        offset = 0
         msgs = []
-        while offset < len(buf):
-            msg = MyTCPMsg.deserialize(buf[offset:])
-            offset += HEADER_SIZE + msg.header.size
-            msgs.append(msg)
-
-        return msgs
+        while True:
+            try:
+                buf = self.recvfrom(100 * self.max_msg_size)
+                offset = 0
+                while offset < len(buf):
+                    msg = MyTCPMsg.deserialize(buf[offset:])
+                    offset += HEADER_SIZE + msg.header.size
+                    msgs.append(msg)
+            except socket.timeout:
+                return msgs
+            except BlockingIOError:
+                return msgs
 
     def send(self, data: bytes):
         self.logger.debug("start send")
@@ -126,13 +138,17 @@ class MyTCPProtocol(UDPBasedProtocol):
             self.logger.debug(f"msg send {msg} | {bytes_send}/{len(data)}")
 
         # Receive acks and resend if timeout
-        while len(self.send_msgs) != 0:
-            try:
-                self._recv_acks()
-            except socket.timeout:
-                for msg in self.send_msgs:
-                    self.logger.debug(f"resend msg {msg}")
-                    self._send_msg(msg, False)
+        attempt = 0
+        while len(self.send_msgs) != 0 and attempt < self.max_resend_attempt:
+            old_msg_len = len(self.send_msgs)
+            self._recv_acks()
+            if old_msg_len == len(self.send_msgs):
+                attempt += 1
+                if attempt % self.resend_rate == 0:
+                    self._send_msg(self.send_msgs[0], False)
+                    self.logger.debug(f"resend msg {self.send_msgs[0]}")
+            else:
+                attempt = 0
 
         self.logger.debug("end send")
         return bytes_send
@@ -143,19 +159,28 @@ class MyTCPProtocol(UDPBasedProtocol):
         self.logger.debug(f"ack send {msg}")
         self._send_msg(msg)
 
+    def _remove_duplicates(self, msgs, known_ack):
+        new_msgs = []
+        for msg in msgs:
+            ack = msg.header.seq_num + len(msg.data) + 1
+            if self.ack_num - 1 <= msg.header.seq_num and ack not in known_ack:
+                known_ack.add(ack)
+                new_msgs.append(msg)
+
+        return new_msgs
+
     # Restore data in appropriate order
     def _restore_data(self):
-        self.recv_msgs.sort(key = lambda msg : msg.header.seq_num)
         data = bytes()
         while len(self.recv_msgs) != 0:
             msg_to_ack = self.recv_msgs[0]
-            # If we already received msg, drop it
-            if self.ack_num - 1 > msg_to_ack.header.seq_num:
-                self.recv_msgs.pop(0)
             # If we got msg with next expected data, append it
-            elif self.ack_num - 1 == msg_to_ack.header.seq_num:
+            if self.ack_num - 1 == msg_to_ack.header.seq_num:
                 self.ack_num = msg_to_ack.header.seq_num + len(msg_to_ack.data) + 1
                 data += msg_to_ack.data
+                self.recv_msgs.pop(0)
+            # If we already received msg, drop it
+            elif self.ack_num - 1 > msg_to_ack.header.seq_num:
                 self.recv_msgs.pop(0)
             # Or we currently don't have data with correct seq num
             else:
@@ -167,15 +192,19 @@ class MyTCPProtocol(UDPBasedProtocol):
     def recv(self, n: int):
         self.logger.debug("start recv")
         data = bytes()
+        attempt = 0
+        known_ack = set()
         while len(data) < n:
-            try:
-                msgs = self._recv_msgs()
-                self.recv_msgs.extend(msgs)
-                data += self._restore_data()
-                for msg in msgs:
-                    self.logger.debug(f"msg recv {msg} | {len(data)}/{n}")
-            except socket.timeout:
-                self._send_ack()
+            msgs = self._remove_duplicates(self._recv_msgs(), known_ack)
+            self.recv_msgs.update(msgs)
+            new_data = self._restore_data()
+            data += new_data
+            if len(new_data) == 0:
+                attempt += 1
+                if attempt % self.ack_rate == 0:
+                    self._send_ack()
+            for msg in msgs:
+                self.logger.debug(f"msg recv {msg} | {len(data)}/{n}")
 
         self._send_ack()
         self.logger.debug("end recv")
